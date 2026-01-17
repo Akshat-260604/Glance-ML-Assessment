@@ -40,7 +40,8 @@ C. HYBRID: BLIP + CLIP + ATTRIBUTE BOOSTING (CHOSEN)
 
 ## System Architecture Diagram
 
-![Architecture Diagram](./architecture_diagram.png)
+<img width="1097" height="292" alt="Screenshot 2026-01-18 at 2 09 23 AM" src="https://github.com/user-attachments/assets/f7e0c601-91ab-427e-a1fa-7be4446a4407" />
+
 
 **Visual Overview:**
 The diagram shows the complete pipeline:
@@ -369,6 +370,3 @@ CLIP: https://github.com/openai/CLIP
 Qdrant: https://qdrant.tech
 SentenceTransformers: https://www.sbert.net
 
-=======================
-END OF DOCUMENT
-=======================
