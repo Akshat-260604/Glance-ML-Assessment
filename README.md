@@ -40,7 +40,7 @@ C. HYBRID: BLIP + CLIP + ATTRIBUTE BOOSTING (CHOSEN)
 
 ## System Architecture Diagram
 
-<img width="858" height="1284" alt="image" src="https://github.com/user-attachments/assets/b2131438-44cb-4b3b-a1dc-afbff9d728b1" />
+<img width="1658" height="1324" alt="image" src="https://github.com/user-attachments/assets/e4547aff-63bc-4d2b-9d56-c3cf5d492fed" />
 
 
 **Visual Overview:**
