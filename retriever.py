@@ -1,7 +1,7 @@
 import torch
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-import re
+import numpy as np
 
 class FashionRetriever:
     def __init__(self, url, api_key):
@@ -12,73 +12,123 @@ class FashionRetriever:
         print("Loading CLIP-based SentenceTransformer for retrieval...")
         self.embedder = SentenceTransformer("sentence-transformers/clip-ViT-B-32", device=self.device)
 
-    def _parse_query_attributes(self, query):
+    def _compute_composition_score(self, query, caption):
+        """
+        Compute composition accuracy: do color-item pairs match in correct order?
+        Example: "red pants black jacket" vs "red jacket black pants"
+        """
         query_lower = query.lower()
+        caption_lower = caption.lower()
         
-        colors = re.findall(
-            r'\b(bright|dark|light|neon)?\s*(red|blue|green|yellow|black|white|orange|purple|pink|brown|gray|grey|beige|navy|maroon|crimson|turquoise|khaki|cream|silver|gold|bronze)\b',
-            query_lower
-        )
-        colors = [f"{modifier} {color}".strip() for modifier, color in colors]
+        colors = ['red', 'blue', 'green', 'yellow', 'black', 'white', 'orange', 
+                  'purple', 'pink', 'brown', 'gray', 'grey', 'beige', 'navy']
+        items = ['pants', 'jacket', 'shirt', 'dress', 'skirt', 'coat', 'top', 
+                 'jeans', 'shorts', 'sweater', 'hoodie', 'blazer', 'suit']
         
-        clothing = re.findall(
-            r'\b(button-?down|button-?up|collared|polo|t-?shirt|tank|sleeveless|crop|oversized|fitted|slim|skinny|straight|bootcut|flared|pleated|pencil|mini|midi|maxi|shorts|pants|jeans|trousers|denim|chinos|sweatpants|hoodie|jacket|blazer|suit|coat|raincoat|windbreaker|dress|skirt|sweater|cardigan|vest|waistcoat|tie|scarf|belt|hat|cap)\b',
-            query_lower
-        )
+        query_pairs = []
+        for color in colors:
+            for item in items:
+                if f"{color} {item}" in query_lower or f"{color}.*{item}" in query_lower:
+                    query_pairs.append((color, item))
         
-        context = re.findall(
-            r'\b(office|corporate|workplace|conference|meeting|street|urban|city|downtown|park|outdoor|indoor|home|casual|formal|professional|business|event|weekend|smart-?casual|black-?tie|white-?tie|business-?casual|cocktail|garden|beach|hiking|gym)\b',
-            query_lower
-        )
+        if not query_pairs:
+            return 1.0
         
-        style = re.findall(
-            r'\b(casual|formal|business|smart|elegant|trendy|vintage|modern|minimalist|bohemian|preppy|athletic|streetwear|haute-?couture)\b',
-            query_lower
-        )
+        match_score = 0.0
+        for color, item in query_pairs:
+            if f"{color} {item}" in caption_lower or f"{color}.*{item}" in caption_lower:
+                match_score += 1.0
+            elif color in caption_lower and item in caption_lower:
+                match_score += 0.3
         
-        return {
-            'colors': list(set(colors)),
-            'clothing': list(set(clothing)),
-            'context': list(set(context)),
-            'style': list(set(style))
-        }
+        return match_score / len(query_pairs)
 
-    def _compute_attribute_boost(self, result_payload, query_attrs):
-        boost_score = 0.0
+    def _compute_intelligent_rerank(self, results, query):
+        """
+        Intelligent re-ranking using:
+        1. CLIP embedding similarity (base score from Qdrant)
+        2. Direct caption-query embedding similarity  
+        3. Composition accuracy (color-item pair matching)
+        4. Caption uniqueness (longer/more detailed = better)
+        5. Inter-result diversity (MMR algorithm)
         
-        result_colors = set(c.lower() for c in result_payload.get('colors', []))
-        result_clothing = set(c.lower() for c in result_payload.get('clothing', []))
-        result_context = set(c.lower() for c in result_payload.get('context', []))
-        result_style = set(s.lower() for s in result_payload.get('style', []))
+        Returns scores in natural [0, 1] range from CLIP similarities.
+        """
+        if not results:
+            return results
         
-        for color in query_attrs['colors']:
-            if color.lower() in result_colors:
-                boost_score += 0.20
+        query_embedding = self.embedder.encode(query, convert_to_tensor=True)
         
-        for item in query_attrs['clothing']:
-            if item.lower() in result_clothing:
-                boost_score += 0.25
+        captions = [r.payload.get('caption', '') for r in results]
+        caption_embeddings = self.embedder.encode(captions, convert_to_tensor=True)
         
-        for ctx in query_attrs['context']:
-            if ctx.lower() in result_context:
-                boost_score += 0.15
+        direct_similarity = torch.nn.functional.cosine_similarity(
+            query_embedding.unsqueeze(0), 
+            caption_embeddings, 
+            dim=1
+        ).cpu().numpy()
         
-        for sty in query_attrs['style']:
-            if sty.lower() in result_style:
-                boost_score += 0.12
+        composition_scores = np.array([
+            self._compute_composition_score(query, caption) 
+            for caption in captions
+        ])
         
-        return boost_score
+        caption_lengths = np.array([len(c.split()) for c in captions])
+        avg_length = caption_lengths.mean()
+        length_deviation = (caption_lengths - avg_length) / (avg_length + 1e-6)
+        uniqueness_scores = 1.0 / (1.0 + np.exp(-length_deviation * 2))
+        
+        diversity_scores = []
+        selected_embeddings = []
+        
+        for i, emb in enumerate(caption_embeddings):
+            if not selected_embeddings:
+                diversity_scores.append(1.0)
+            else:
+                similarities = torch.stack([
+                    torch.nn.functional.cosine_similarity(
+                        emb.unsqueeze(0), 
+                        sel_emb.unsqueeze(0), 
+                        dim=1
+                    )
+                    for sel_emb in selected_embeddings
+                ])
+                max_sim = similarities.max().item()
+                diversity_scores.append(1.0 - max_sim * 0.3)
+            
+            if i < len(results) // 2:
+                selected_embeddings.append(emb)
+        
+        diversity_scores = np.array(diversity_scores)
+        
+        base_scores = np.array([r.score for r in results])
+        
+        final_scores = (
+            base_scores * 0.40 +
+            direct_similarity * 0.30 +
+            composition_scores * 0.20 +
+            (uniqueness_scores - 0.5) * 0.05 +
+            (diversity_scores - 1.0) * 0.05
+        )
+        
+        final_scores = np.clip(final_scores, 0.0, 1.0)
+        
+        for i, result in enumerate(results):
+            result.score = float(final_scores[i])
+        
+        return sorted(results, key=lambda x: x.score, reverse=True)
 
     def search(self, query, k=3):
         """
-        Search for fashion images matching the query.
+        Intelligent semantic search with automatic re-ranking.
+        Uses CLIP embeddings to compute relevance, uniqueness, and diversity.
         
         Args:
             query: Natural language description
             k: Number of results to return
             
         Returns:
-            List of top-k results with normalized scores [0, 1]
+            List of top-k results with intelligently computed scores
         """
         try:
             query_vec = self.embedder.encode(query).tolist()
@@ -87,11 +137,10 @@ class FashionRetriever:
             return []
 
         try:
-            from qdrant_client.models import PointStruct
             raw_results = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_vec,
-                limit=k * 3,
+                limit=k * 5,
                 with_payload=True
             ).points
         except Exception as e:
@@ -101,28 +150,16 @@ class FashionRetriever:
         if not raw_results:
             return []
 
-        query_attrs = self._parse_query_attributes(query)
-        
-        for result in raw_results:
-            attribute_boost = self._compute_attribute_boost(result.payload, query_attrs)
-            normalized_boost = min(attribute_boost / 14.4, 0.5)
-            
-            result.score = result.score + normalized_boost
+        reranked_results = self._compute_intelligent_rerank(raw_results, query)
 
         seen_images = set()
         unique_results = []
-        for result in sorted(raw_results, key=lambda x: x.score, reverse=True):
+        for result in reranked_results:
             img_name = result.payload.get('image_name', '')
             if img_name not in seen_images:
                 seen_images.add(img_name)
                 unique_results.append(result)
                 if len(unique_results) >= k:
                     break
-
-        if unique_results:
-            max_score = max(r.score for r in unique_results)
-            if max_score > 1.0:
-                for result in unique_results:
-                    result.score = result.score / max_score
 
         return unique_results

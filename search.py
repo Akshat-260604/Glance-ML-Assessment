@@ -44,7 +44,9 @@ def main():
     print("(Type 'exit' to quit)")
     while True:
         try:
-            user_q = input("\nEnter what you are looking for: ")
+            user_q = input("\nEnter what you are looking for: ").strip()
+            if not user_q:
+                continue
             if user_q.lower() == 'exit':
                 break
             
@@ -62,6 +64,9 @@ def main():
                 print(f"       Clothing: {payload.get('clothing', [])}")
                 print(f"       Context: {payload.get('context', [])}")
                 print(f"       Style: {payload.get('style', [])}")
+        except EOFError:
+            print("\nExiting...")
+            break
         except KeyboardInterrupt:
             print("\nExiting...")
             break
